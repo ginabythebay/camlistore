@@ -57,6 +57,7 @@ import (
 	"camlistore.org/pkg/importer"
 	"camlistore.org/pkg/schema"
 	"camlistore.org/pkg/schema/nodeattr"
+	"camlistore.org/pkg/syncutil"
 )
 
 func init() {
@@ -159,6 +160,7 @@ func (im *imp) Run(ctx *importer.RunContext) (err error) {
 	r := &run{
 		RunContext: ctx,
 		im:         im,
+		postGate:   syncutil.NewGate(3),
 		nextCursor: time.Now().Format(timeFormat),
 		nextAfter:  time.Now(),
 	}
@@ -172,7 +174,8 @@ func (im *imp) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 type run struct {
 	*importer.RunContext
-	im *imp
+	im       *imp
+	postGate *syncutil.Gate
 
 	// The next batch should fetch items with timestamps up to this
 	nextCursor string
@@ -270,7 +273,6 @@ func (r *run) importBatch(authToken string, parent *importer.Object) (keepTrying
 		return false, fmt.Errorf("Unexpected status code %v fetching %v", resp.StatusCode, u)
 	}
 	body, err := ioutil.ReadAll(resp.Body)
-	log.Print(string(body))
 	if err != nil {
 		return false, err
 	}
@@ -291,22 +293,26 @@ func (r *run) importBatch(authToken string, parent *importer.Object) (keepTrying
 	}
 
 	log.Printf("Importing %d posts...", postCount)
+	var grp syncutil.Group
 	for _, post := range postBatch {
 		if r.Context.IsCanceled() {
 			log.Printf("Pinboard importer: interrupted")
 			return false, context.ErrCanceled
 		}
-		err := r.importPost(&post, parent)
-		if err != nil {
-			return false, err
-		}
+
+		r.postGate.Start()
+		grp.Go(func() error {
+			defer r.postGate.Done()
+			return r.importPost(&post, parent)
+		})
 	}
 
 	log.Printf("Imported batch of %d posts in %s", postCount, time.Now().Sub(start))
 
 	r.nextCursor = postBatch[postCount-1].Time
 	r.nextAfter = time.Now().Add(pauseInterval)
-	return true, nil
+	tryAgain := postCount == batchLimit
+	return tryAgain, grp.Err()
 }
 
 func (r *run) importPosts() (*importer.Object, error) {
